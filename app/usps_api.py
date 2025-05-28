@@ -7,13 +7,16 @@ import html
 import xmltodict
 from redis import asyncio as aioredis
 import httpx
+from typing import Dict, Any, Optional
 
 from . import config
 
 
 USPS_API_URL = "https://services.usps.com"
 USPS_SERVICE_API_BASE = "https://iv.usps.com/ivws_api/informedvisapi/"
-USPS_ADDRESS_API_URL = 'https://secure.shippingapis.com/ShippingAPI.dll'
+_USPS_STDZ_URL = "https://api.usps.com/addresses/v3/address"
+_TOKEN: dict[str, Any] = {"value": None, "expires": 0}
+_TOKEN_URL = "https://api.usps.com/oauth2/v3/token"
 
 headers = {'Content-type': 'application/json'}
 
@@ -112,60 +115,96 @@ async def get_piece_tracking(imb: str):
         return {"error": "HTTPError", "error_description": str(err)}
     return response.json()
 
+async def _get_usps_token(client: httpx.AsyncClient) -> str:
+    """Return a cached Bearer token or fetch a fresh one."""
+    if _TOKEN["value"] and _TOKEN["expires"] - time.time() > 60:
+        return _TOKEN["value"]
 
-async def get_USPS_standardized_address(address):
-    req = ""
-    if 'firmname' in address:
-        req += f"<FirmName>{address['firmname']}</FirmName>"
-    req += str(f"""
-        <Address1>{address['address1']}</Address1>
-        <Address2>{address['address2']}</Address2>
-        <City>{address['city']}</City>
-        <State>{address['state']}</State>
-        <Zip5>{address['zip5']}</Zip5>
-    """)
-    if 'zip4' in address:
-        req += f"<Zip4>{address['zip4']}</Zip4>"
-    else:
-        req += "<Zip4/>"
-
-    address_xml = f"""
-    <Address ID="0">{req}</Address>
-    """
-
-    request_xml = f"""
-    <AddressValidateRequest USERID="{config.USPS_WEBAPI_USERNAME}">
-        <Revision>1</Revision>
-        {address_xml}
-    </AddressValidateRequest>
-    """
-    try:
-        response = await httpx_client.get(USPS_ADDRESS_API_URL, params={'API': 'Verify', 'XML': request_xml})
-    except httpx.HTTPError as err:
-        return {"error": "HTTPError", "error_description": str(err)}
-    response_dict = xmltodict.parse(response.content)
-
-    if 'Error' in response_dict:
-        return {'error': html.unescape(response_dict['Error']['Description'])}
-
-    if 'Error' in response_dict['AddressValidateResponse']['Address']:
-        return {'error': html.unescape(response_dict['AddressValidateResponse']['Address']['Error']['Description'])}
-
-    if 'Address1' not in response_dict['AddressValidateResponse']['Address']:
-        response_dict['AddressValidateResponse']['Address']['Address1'] = ''
-    if 'FirmName' not in response_dict['AddressValidateResponse']['Address']:
-        response_dict['AddressValidateResponse']['Address']['FirmName'] = ''
-    standardized_address = {
-        'firmname': response_dict['AddressValidateResponse']['Address']['FirmName'],
-        'address1': response_dict['AddressValidateResponse']['Address']['Address1'],
-        'address2': response_dict['AddressValidateResponse']['Address']['Address2'],
-        'city': response_dict['AddressValidateResponse']['Address']['City'],
-        'state': response_dict['AddressValidateResponse']['Address']['State'],
-        'zip5': response_dict['AddressValidateResponse']['Address']['Zip5'],
-        'zip4': response_dict['AddressValidateResponse']['Address']['Zip4'],
-        'dp': response_dict['AddressValidateResponse']['Address'].get('DeliveryPoint', ''),
+    data = {
+        "grant_type": "client_credentials",
+        "client_id":     config.USPS_CLIENT_ID,
+        "client_secret": config.USPS_CLIENT_SECRET,
     }
+    r = await client.post(_TOKEN_URL, data=data, timeout=20)
+    r.raise_for_status()
+    j = r.json()
 
+    _TOKEN["value"]   = j["access_token"]
+    _TOKEN["expires"] = time.time() + j.get("expires_in", 1800)
+    return _TOKEN["value"]
+
+async def get_USPS_standardized_address(address: Dict[str, str]) -> Dict[str, Any]:
+    """
+    Validate & standardize an address using USPS Addresses 3.0.
+
+    `address` keys accepted (all lower-case):
+        firmname, address1 (secondary/unit), address2 (street),
+        city, state*, zip5, zip4, urbanization
+
+    Returns either:
+        {'error': '…'}   on failure
+        {standardized-fields…} on success
+    """
+    # ---- map our field names -> USPS query params --------------------------
+    params: dict[str, str] = {}
+
+    if address.get("firmname"):
+        params["firm"] = address["firmname"]
+
+    # USPS: streetAddress = primary line  (our address2)
+    params["streetAddress"] = address.get("address2", "")
+
+    # USPS: secondaryAddress = apartment / suite (our address1)
+    if address.get("address1"):
+        params["secondaryAddress"] = address["address1"]
+
+    if address.get("city"):
+        params["city"] = address["city"]
+
+    if not address.get("state"):
+        return {"error": "state is required"}
+    params["state"] = address["state"]
+
+    if address.get("urbanization"):
+        params["urbanization"] = address["urbanization"]
+
+    if address.get("zip5"):
+        params["ZIPCode"] = address["zip5"]
+
+    if address.get("zip4"):
+        params["ZIPPlus4"] = address["zip4"]
+
+    # -----------------------------------------------------------------------
+    async with httpx.AsyncClient(timeout=20) as client:
+        try:
+            token = await _get_usps_token(client)
+        except httpx.HTTPError as err:
+            return {"error": "TokenError", "error_description": str(err)}
+
+        headers = {"Authorization": f"Bearer {token}", "Accept": "application/json"}
+
+        try:
+            r = await client.get(_USPS_STDZ_URL, params=params, headers=headers)
+        except Exception as e:
+            return {"error": str(e)}
+    # -----------------------------------------------------------------------
+    payload = r.json()
+    
+    if "error" in payload:
+        # pick first error, strip HTML entities
+        msg = str(payload["error"])
+        return {"error": html.unescape(msg)}
+    address = payload.get("address", {})
+    standardized_address = {
+        "firmname":  payload.get("firm", ""),
+        "address1":  address.get("secondaryAddress", ""), # address1 is address line 2
+        "address2":  address.get("streetAddress", ""), # address2 is address line 1 (street)
+        "city":      address.get("city", ""),
+        "state":     address.get("state", ""),
+        "zip5":      address.get("ZIPCode", ""),
+        "zip4":      address.get("ZIPPlus4", ""),
+        "dp":        payload.get("additionalInfo", {}).get("deliveryPoint", ""),
+    }
     return standardized_address
 
 
